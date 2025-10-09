@@ -1,8 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from pathlib import Path
+from dotenv import load_dotenv
 from backend.app.db import init_db
 from backend.app.routers import common, erp, crm, ehr, lms, documents, review_queue
+
+# Load environment variables from backend/.env file
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

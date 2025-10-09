@@ -1,5 +1,6 @@
 """Document parsing service with OCR and text extraction"""
 import re
+import os
 from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
 
@@ -38,10 +39,18 @@ def _check_pdf2image():
             _PDF2IMAGE_AVAILABLE = False
     return _PDF2IMAGE_AVAILABLE
 
+def _check_pypdf2():
+    """Check if PyPDF2 is available for text extraction"""
+    try:
+        import PyPDF2
+        return True
+    except ImportError:
+        return False
+
 class DocumentParser:
     """Handles OCR and structured text extraction from documents"""
     
-    def __init__(self):
+    def __init__(self, use_llm: bool = True):
         # Common patterns for extracting structured data
         self.address_pattern = re.compile(
             r'(\d+\s+[\w\s]+(?:street|st|avenue|ave|road|rd|drive|dr|lane|ln|blvd|boulevard|way|court|ct|place|pl))'
@@ -51,6 +60,18 @@ class DocumentParser:
         self.phone_pattern = re.compile(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}')
         self.email_pattern = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
         self.name_pattern = re.compile(r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)$', re.MULTILINE)
+        
+        # LLM parser (optional)
+        self.llm_parser = None
+        
+        if use_llm:
+            try:
+                from backend.app.services.llm_parser import LLMDocumentParser
+                self.llm_parser = LLMDocumentParser()
+                if self.llm_parser.available:
+                    print("✅ LLM-based parsing enabled", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not initialize LLM parser: {e}", flush=True)
     
     def extract_text_from_image(self, image_path: str) -> str:
         """Extract text from image using OCR"""
@@ -70,7 +91,37 @@ class DocumentParser:
             raise ValueError(f"Error extracting text from image: {str(e)}")
     
     def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF using OCR"""
+        """
+        Extract text from PDF - tries direct text extraction first, falls back to OCR
+        
+        Strategy:
+        1. Try PyPDF2 for direct text extraction (fast, works for text-based PDFs)
+        2. If no text found or PyPDF2 unavailable, use OCR (slower, works for scanned PDFs)
+        """
+        # Try direct text extraction first
+        if _check_pypdf2():
+            try:
+                import PyPDF2
+                
+                with open(pdf_path, 'rb') as file:
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    text_parts = []
+                    
+                    for i, page in enumerate(pdf_reader.pages):
+                        page_text = page.extract_text()
+                        if page_text.strip():  # If there's actual text
+                            text_parts.append(f"--- Page {i+1} ---\n{page_text}")
+                    
+                    if text_parts:
+                        extracted_text = "\n\n".join(text_parts)
+                        print(f"✓ Extracted {len(extracted_text)} chars from PDF using direct text extraction")
+                        return extracted_text
+                    else:
+                        print("⚠ No embedded text found in PDF, falling back to OCR...")
+            except Exception as e:
+                print(f"⚠ Direct PDF text extraction failed ({str(e)}), trying OCR...")
+        
+        # Fall back to OCR
         if not _check_pdf2image():
             raise ValueError("pdf2image not installed. Install with: pip install pdf2image")
         if not _check_pytesseract():
@@ -80,6 +131,7 @@ class DocumentParser:
             from pdf2image import convert_from_path
             import pytesseract
             
+            print("🔍 Converting PDF to images for OCR...")
             # Convert PDF to images
             images = convert_from_path(pdf_path)
             
@@ -88,18 +140,30 @@ class DocumentParser:
             for i, image in enumerate(images):
                 text = pytesseract.image_to_string(image)
                 full_text.append(f"--- Page {i+1} ---\n{text}")
+                print(f"  Processed page {i+1}/{len(images)}")
             
-            return "\n\n".join(full_text)
+            result = "\n\n".join(full_text)
+            print(f"✓ OCR complete: extracted {len(result)} chars")
+            return result
         except Exception as e:
             raise ValueError(f"Error extracting text from PDF: {str(e)}")
     
     def parse_document_blocks(self, text: str) -> Tuple[Optional[str], Optional[str], str]:
         """
         Parse document into sender, recipient, and body sections
+        Uses LLM if available, falls back to heuristic parsing
         
         Returns:
             Tuple of (sender_text, recipient_text, body_text)
         """
+        # Try LLM parsing first
+        if self.llm_parser and self.llm_parser.available:
+            sender, recipient, body = self.llm_parser.parse_document_with_llm(text)
+            if sender or recipient:  # If LLM found something, use it
+                return sender, recipient, body
+            print("⚠️ LLM didn't find sender/recipient, falling back to heuristics")
+        
+        # Fall back to heuristic parsing
         lines = text.strip().split('\n')
         
         # Heuristic: First non-empty block (top ~10 lines) is often sender
@@ -141,8 +205,22 @@ class DocumentParser:
         
         return sender_text, recipient_text, body_text
     
-    def extract_structured_data(self, text: str) -> Dict[str, Any]:
-        """Extract structured fields from text block"""
+    def extract_structured_data(self, text: str, block_type: str = "unknown") -> Dict[str, Any]:
+        """
+        Extract structured fields from text block
+        Uses LLM if available for better accuracy
+        
+        Args:
+            text: Raw text block
+            block_type: "sender" or "recipient" for LLM context
+        """
+        # Try LLM extraction first
+        if self.llm_parser and self.llm_parser.available and text:
+            llm_data = self.llm_parser.extract_structured_with_llm(text, block_type)
+            if llm_data:  # If LLM found fields, use them
+                return llm_data
+        
+        # Fall back to regex patterns
         data = {}
         
         # Extract addresses
@@ -210,8 +288,8 @@ class DocumentParser:
         sender_text, recipient_text, body_text = self.parse_document_blocks(raw_text)
         
         # Extract structured data
-        parsed_sender = self.extract_structured_data(sender_text) if sender_text else {}
-        parsed_recipient = self.extract_structured_data(recipient_text) if recipient_text else {}
+        parsed_sender = self.extract_structured_data(sender_text, "sender") if sender_text else {}
+        parsed_recipient = self.extract_structured_data(recipient_text, "recipient") if recipient_text else {}
         
         return {
             'raw_text': raw_text,

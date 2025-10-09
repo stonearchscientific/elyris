@@ -32,6 +32,10 @@ backend/ENV/
 backend/env/
 backend/elyris-venv/
 
+# Environment files with secrets
+.env
+backend/.env
+
 # Database
 *.db
 *.sqlite

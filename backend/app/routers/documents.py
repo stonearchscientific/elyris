@@ -54,8 +54,8 @@ async def upload_document(
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="Invalid manual_data JSON")
         
-        # 3. Parse document (OCR)
-        parser = DocumentParser()
+        # 3. Parse document (OCR/LLM)
+        parser = DocumentParser(use_llm=True)  # Enable LLM parsing
         parsed_data = parser.parse_document(str(file_path))
         
         # 4. Override parsed data with manual data if provided
