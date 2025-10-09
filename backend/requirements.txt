@@ -4,3 +4,8 @@ sqlmodel
 pydantic
 python-multipart
 Jinja2
+pytesseract
+pdf2image
+pillow
+sentence-transformers
+numpy

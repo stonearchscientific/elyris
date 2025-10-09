@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict, Any
 from sqlmodel import SQLModel, Field, Column
 from sqlalchemy import JSON
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 import uuid
 
 # Shared canonical models
@@ -11,15 +11,64 @@ class Person(SQLModel, table=True):
     last_name: str
     dob: Optional[date] = None
     legal_flags: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class GlobalPosition(SQLModel, table=True):
+    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    lat: float
+    lng: float
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class Location(SQLModel, table=True):
+    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    name: str
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip: Optional[str] = None
+    country: Optional[str] = None
+    global_position_id: Optional[str] = Field(default=None, foreign_key="globalposition.id")
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    website: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Document(SQLModel, table=True):
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     person_id: Optional[str] = Field(default=None, foreign_key="person.id")
+    location_id: Optional[str] = Field(default=None, foreign_key="location.id")
     doc_type: Optional[str] = None
     file_path: Optional[str] = None
+    raw_text: Optional[str] = None  # OCR extracted text
     extracted_fields: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
-    uploaded_at: datetime = Field(default_factory=datetime.utcnow)
+    uploaded_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class DocumentParse(SQLModel, table=True):
+    """Stores parsed data blocks from documents before mapping to entities"""
+    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    document_id: str = Field(foreign_key="document.id")
+    sender_text: Optional[str] = None  # Raw text of sender info
+    recipient_text: Optional[str] = None  # Raw text of recipient info
+    body_text: Optional[str] = None  # Main document text
+    parsed_sender: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    parsed_recipient: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class ReviewQueueItem(SQLModel, table=True):
+    """Tracks entities requiring manual review for Smart Query"""
+    id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    document_parse_id: str = Field(foreign_key="documentparse.id")
+    entity_type: str  # "person", "location"
+    query_type: str  # "no_results", "multiple_results"
+    candidate_matches: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    raw_data: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    status: str = "pending"  # pending, resolved, skipped
+    resolved_entity_id: Optional[str] = None
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Event(SQLModel, table=True):
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
@@ -29,7 +78,7 @@ class Event(SQLModel, table=True):
     end_ts: Optional[datetime] = None
     location: Optional[str] = None
     event_metadata: Optional[Dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # ERP: benefits example
 class ErpBenefit(SQLModel, table=True):
