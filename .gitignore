@@ -30,12 +30,17 @@ backend/.venv/
 backend/venv/
 backend/ENV/
 backend/env/
+backend/elyris-venv/
 
 # Database
 *.db
 *.sqlite
 *.sqlite3
 backend/data/
+
+# Temporary scripts
+backend/*_db.py
+backend/fix_*.py
 
 # IDE
 .vscode/
