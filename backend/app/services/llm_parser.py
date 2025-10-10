@@ -129,6 +129,15 @@ Return ONLY valid JSON, no explanation."""
             recipient = result.get('recipient_text')
             body = result.get('body_text', text)
             
+            # Validate that sender/recipient are strings (or None), not dicts
+            # LLM sometimes ignores instructions and returns nested JSON
+            if sender and not isinstance(sender, str):
+                print(f"⚠️ LLM returned non-string sender_text (type: {type(sender).__name__}), ignoring", flush=True)
+                sender = None
+            if recipient and not isinstance(recipient, str):
+                print(f"⚠️ LLM returned non-string recipient_text (type: {type(recipient).__name__}), ignoring", flush=True)
+                recipient = None
+            
             print(f"✓ LLM parsing complete: sender={'found' if sender else 'not found'}, recipient={'found' if recipient else 'not found'}", flush=True)
             
             return sender, recipient, body
@@ -169,7 +178,7 @@ Return ONLY valid JSON, no explanation."""
         elif block_type == "recipient":
             # Extract name from first line if missing
             if not result.get('first_name') or not result.get('last_name'):
-                if lines:
+                if lines and isinstance(lines[0], str):
                     name_parts = lines[0].split()
                     if len(name_parts) >= 2:
                         if not result.get('first_name'):
@@ -182,6 +191,8 @@ Return ONLY valid JSON, no explanation."""
             if not result.get('city') or not result.get('state'):
                 # Look for line that has city, state, zip pattern
                 for line in lines:
+                    if not isinstance(line, str):
+                        continue
                     # Skip street addresses (lines with numbers at start or "DR", "ST", "AVE")
                     if re.match(r'^\d+\s', line) or any(suffix in line.upper() for suffix in [' DR', ' ST', ' AVE', ' RD', ' LN', ' CT', 'VIEW', 'STREET', 'DRIVE']):
                         continue

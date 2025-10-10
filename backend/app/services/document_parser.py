@@ -187,19 +187,40 @@ class DocumentParser:
         recipient_block = []
         recipient_start_idx = None
         
-        # Strategy 1: Look for explicit indicators ("To:", "Re:")
-        for i, line in enumerate(remaining_lines[:20]):
+        # Strategy 0: Look for "Payer Information" or similar receipt patterns
+        for i, line in enumerate(remaining_lines[:30]):
             line_stripped = line.strip()
-            if 'to:' in line_stripped.lower() or 're:' in line_stripped.lower():
-                # Found indicator, collect next few lines
-                for j in range(i+1, min(i+6, len(remaining_lines))):
+            if 'payer information' in line_stripped.lower() or 'recipient information' in line_stripped.lower():
+                # Found receipt-style header, collect next few lines (name, address, phone, email)
+                for j in range(i+1, min(i+8, len(remaining_lines))):
                     next_line = remaining_lines[j].strip()
                     if next_line:
+                        # Stop if we hit another section header
+                        if any(keyword in next_line.lower() for keyword in ['account information', 'transaction', 'payment', 'summary']):
+                            break
                         recipient_block.append(next_line)
                 if recipient_block:
                     recipient_text = '\n'.join(recipient_block)
                     recipient_start_idx = i + len(recipient_block) + 1
+                    # For receipts, there's often no traditional "sender", so skip sender detection
+                    sender_text = None
                 break
+        
+        # Strategy 1: Look for explicit indicators ("To:", "Re:")
+        if not recipient_text:
+            recipient_block = []  # Reset block
+            for i, line in enumerate(remaining_lines[:20]):
+                line_stripped = line.strip()
+                if 'to:' in line_stripped.lower() or 're:' in line_stripped.lower():
+                    # Found indicator, collect next few lines
+                    for j in range(i+1, min(i+6, len(remaining_lines))):
+                        next_line = remaining_lines[j].strip()
+                        if next_line:
+                            recipient_block.append(next_line)
+                    if recipient_block:
+                        recipient_text = '\n'.join(recipient_block)
+                        recipient_start_idx = i + len(recipient_block) + 1
+                    break
         
         # Strategy 2: If no explicit indicator, look for "Dear..." and take preceding address block
         if not recipient_text:
