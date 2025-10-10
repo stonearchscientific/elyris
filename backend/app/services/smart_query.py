@@ -1,8 +1,12 @@
 """Smart Query service for entity matching with precedence: SQL → Semantic → Manual Review"""
 from typing import Dict, Any, List, Optional, Tuple
 from sqlmodel import Session, select
+from sqlalchemy import func
 
 from backend.app.models import Person, Location, ReviewQueueItem, DocumentParse
+from .logging_config import setup_logger
+
+logger = setup_logger(__name__)
 
 # Lazy import for optional dependencies
 _SENTENCE_TRANSFORMER_AVAILABLE = None
@@ -211,15 +215,28 @@ class SmartQueryService:
             # Single semantic match - use it
             return semantic_matches[0][0].id
         elif len(semantic_matches) == 0:
-            # No results - queue for manual review
-            self._queue_for_review(
-                document_parse_id=document_parse_id,
-                entity_type="person",
-                query_type="no_results",
-                raw_data=data,
-                candidates=[]
-            )
-            return None
+            # No results - create new person
+            if data.get('first_name') and data.get('last_name'):
+                new_person = Person(
+                    first_name=data['first_name'],
+                    last_name=data['last_name'],
+                    dob=data.get('dob')
+                )
+                self.session.add(new_person)
+                self.session.commit()
+                self.session.refresh(new_person)
+                logger.info(f"✅ Created new Person: {new_person.first_name} {new_person.last_name} (ID: {new_person.id})")
+                return new_person.id
+            else:
+                # Insufficient data to create person - queue for review
+                self._queue_for_review(
+                    document_parse_id=document_parse_id,
+                    entity_type="person",
+                    query_type="no_results",
+                    raw_data=data,
+                    candidates=[]
+                )
+                return None
         else:
             # Multiple results - queue for manual review with candidates
             candidates = [

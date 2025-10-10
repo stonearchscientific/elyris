@@ -3,6 +3,12 @@ import re
 import os
 from typing import Dict, Any, Tuple, Optional
 from pathlib import Path
+from .logging_config import setup_logger
+
+logger = setup_logger(__name__)
+
+# Debug mode controlled by environment variable
+DEBUG_PARSING = os.getenv('DEBUG_DOCUMENT_PARSING', 'false').lower() == 'true'
 
 # Lazy imports for optional OCR dependencies
 _PIL_AVAILABLE = None
@@ -114,12 +120,12 @@ class DocumentParser:
                     
                     if text_parts:
                         extracted_text = "\n\n".join(text_parts)
-                        print(f"✓ Extracted {len(extracted_text)} chars from PDF using direct text extraction")
+                        logger.info(f"✓ Extracted {len(extracted_text)} chars from PDF using direct text extraction")
                         return extracted_text
                     else:
-                        print("⚠ No embedded text found in PDF, falling back to OCR...")
+                        logger.info("⚠ No embedded text found in PDF, falling back to OCR...")
             except Exception as e:
-                print(f"⚠ Direct PDF text extraction failed ({str(e)}), trying OCR...")
+                logger.warning(f"Direct PDF text extraction failed ({str(e)}), trying OCR...")
         
         # Fall back to OCR
         if not _check_pdf2image():
@@ -131,7 +137,7 @@ class DocumentParser:
             from pdf2image import convert_from_path
             import pytesseract
             
-            print("🔍 Converting PDF to images for OCR...")
+            logger.info("🔍 Converting PDF to images for OCR...")
             # Convert PDF to images
             images = convert_from_path(pdf_path)
             
@@ -140,10 +146,10 @@ class DocumentParser:
             for i, image in enumerate(images):
                 text = pytesseract.image_to_string(image)
                 full_text.append(f"--- Page {i+1} ---\n{text}")
-                print(f"  Processed page {i+1}/{len(images)}")
+                logger.debug(f"Processed page {i+1}/{len(images)}")
             
             result = "\n\n".join(full_text)
-            print(f"✓ OCR complete: extracted {len(result)} chars")
+            logger.info(f"✓ OCR complete: extracted {len(result)} chars")
             return result
         except Exception as e:
             raise ValueError(f"Error extracting text from PDF: {str(e)}")
@@ -161,88 +167,178 @@ class DocumentParser:
             sender, recipient, body = self.llm_parser.parse_document_with_llm(text)
             if sender or recipient:  # If LLM found something, use it
                 return sender, recipient, body
-            print("⚠️ LLM didn't find sender/recipient, falling back to heuristics")
+            logger.info("⚠️ LLM didn't find sender/recipient, falling back to heuristics")
         
         # Fall back to heuristic parsing
         lines = text.strip().split('\n')
         
-        # Heuristic: First non-empty block (top ~10 lines) is often sender
         sender_text = None
         recipient_text = None
+        recipient_start_idx = None
         body_start = 0
         
-        # Extract first text block as potential sender (top left corner)
-        first_block = []
-        for i, line in enumerate(lines[:15]):
-            line = line.strip()
-            if line:
-                first_block.append(line)
-                if len(first_block) >= 5:  # Take first 5 non-empty lines
-                    sender_text = '\n'.join(first_block)
+        # PRE-CHECK: Detect if this is a quote/email format
+        # Look for "Hi/Hello [Name]" in first 20 lines AND signature at end
+        is_quote_format = False
+        for i, line in enumerate(lines[:20]):
+            line_stripped = line.strip()
+            # Match patterns like "Hi Heather Holcombe," or "Hello John,"
+            if re.match(r'^(hi|hello|hey)\s+([a-z]+(\s+[a-z]+)?)[,:]', line_stripped, re.IGNORECASE):
+                # Extract recipient name from salutation
+                match = re.match(r'^(hi|hello|hey)\s+([a-z\s]+)[,:]', line_stripped, re.IGNORECASE)
+                if match:
+                    recipient_text = match.group(2).strip()
+                    is_quote_format = True
                     body_start = i + 1
+                    
+                    # Look for signature after the salutation (search forward in next 50 lines)
+                    # Signatures typically appear after "Thank you," or similar closings
+                    for j in range(i+1, min(i+50, len(lines))):
+                        sig_line = lines[j].strip()
+                        # Look for email pattern or phone pattern
+                        if '@' in sig_line or re.search(r'\(\d{3}\)\s*\d{3}[-\s]*\d{4}', sig_line):
+                            # Found email/phone, look backwards for closing phrase or name
+                            sender_lines = []
+                            sig_start = j - 3  # Default: 3 lines back (closing, name, phone/email)
+                            
+                            # Try to find a closing phrase ("Thank you,", "Sincerely,", etc.)
+                            for k in range(j-1, max(j-10, i), -1):
+                                check_line = lines[k].strip().lower()
+                                if any(phrase in check_line for phrase in ['thank you', 'thanks', 'sincerely', 'best', 'regards']):
+                                    sig_start = k
+                                    break
+                            
+                            # Collect signature from closing/name to email/phone
+                            for k in range(max(sig_start, i), j+2):  # Include line after phone (might be email)
+                                potential_line = lines[k].strip()
+                                if potential_line and not potential_line.startswith('---'):
+                                    # Skip body text indicators
+                                    if not any(word in potential_line.lower() for word in ['proposed', 'details', 'reply to this', 'services below']):
+                                        sender_lines.append(potential_line)
+                            if sender_lines:
+                                sender_text = '\n'.join(sender_lines)
+                            break
                     break
         
-        # Look for recipient using multiple strategies
-        remaining_lines = lines[body_start:]
-        recipient_block = []
-        recipient_start_idx = None
-        
-        # Strategy 0: Look for "Payer Information" or similar receipt patterns
-        for i, line in enumerate(remaining_lines[:30]):
-            line_stripped = line.strip()
-            if 'payer information' in line_stripped.lower() or 'recipient information' in line_stripped.lower():
-                # Found receipt-style header, collect next few lines (name, address, phone, email)
-                for j in range(i+1, min(i+8, len(remaining_lines))):
-                    next_line = remaining_lines[j].strip()
-                    if next_line:
-                        # Stop if we hit another section header
-                        if any(keyword in next_line.lower() for keyword in ['account information', 'transaction', 'payment', 'summary']):
+        # If not a quote format, use traditional letterhead detection
+        if not is_quote_format:
+            # FIRST: Look for "Dear..." to find where recipient/body starts
+            dear_line_idx = None
+            for i, line in enumerate(lines[:50]):
+                if line.strip().lower().startswith('dear '):
+                    dear_line_idx = i
+                    break
+            
+            if dear_line_idx:
+                # Found "Dear", now work backwards to find recipient block
+                # Recipient typically appears just before "Dear" (name + address)
+                recipient_lines = []
+                for j in range(dear_line_idx - 1, -1, -1):
+                    prev_line = lines[j].strip()
+                    if prev_line and not prev_line.startswith('---'):
+                        recipient_lines.insert(0, prev_line)
+                    elif recipient_lines:  # Hit empty line after collecting lines
+                        break
+                
+                if recipient_lines and len(recipient_lines) >= 2:
+                    recipient_text = '\n'.join(recipient_lines)
+                    # Sender is everything before recipient
+                    sender_end = dear_line_idx - len(recipient_lines) - 1
+                    sender_lines = []
+                    for k in range(sender_end):
+                        sender_line = lines[k].strip()
+                        if sender_line and not sender_line.startswith('---'):
+                            sender_lines.append(sender_line)
+                    if sender_lines:
+                        sender_text = '\n'.join(sender_lines)
+                    body_start = dear_line_idx
+                else:
+                    # No clear recipient block before "Dear", just take first lines as sender
+                    sender_lines = []
+                    for i, line in enumerate(lines[:dear_line_idx]):
+                        line = line.strip()
+                        if line and not line.startswith('---'):
+                            sender_lines.append(line)
+                            if len(sender_lines) >= 5:
+                                break
+                    if sender_lines:
+                        sender_text = '\n'.join(sender_lines)
+                    body_start = dear_line_idx
+            else:
+                # No "Dear" found - use simple first 5 lines heuristic
+                first_block = []
+                for i, line in enumerate(lines[:15]):
+                    line = line.strip()
+                    if line and not line.startswith('---'):
+                        first_block.append(line)
+                        if len(first_block) >= 5:
+                            sender_text = '\n'.join(first_block)
+                            body_start = i + 1
                             break
-                        recipient_block.append(next_line)
-                if recipient_block:
-                    recipient_text = '\n'.join(recipient_block)
-                    recipient_start_idx = i + len(recipient_block) + 1
-                    # For receipts, there's often no traditional "sender", so skip sender detection
-                    sender_text = None
-                break
         
-        # Strategy 1: Look for explicit indicators ("To:", "Re:")
+        # Look for recipient using multiple strategies (if not already found)
         if not recipient_text:
-            recipient_block = []  # Reset block
-            for i, line in enumerate(remaining_lines[:20]):
+            remaining_lines = lines[body_start:]
+            recipient_block = []
+            recipient_start_idx = None
+            
+            # Strategy 0: Look for "Payer Information" or similar receipt patterns
+            for i, line in enumerate(remaining_lines[:30]):
                 line_stripped = line.strip()
-                if 'to:' in line_stripped.lower() or 're:' in line_stripped.lower():
-                    # Found indicator, collect next few lines
-                    for j in range(i+1, min(i+6, len(remaining_lines))):
+                if 'payer information' in line_stripped.lower() or 'recipient information' in line_stripped.lower():
+                    # Found receipt-style header, collect next few lines (name, address, phone, email)
+                    for j in range(i+1, min(i+8, len(remaining_lines))):
                         next_line = remaining_lines[j].strip()
                         if next_line:
+                            # Stop if we hit another section header
+                            if any(keyword in next_line.lower() for keyword in ['account information', 'transaction', 'payment', 'summary']):
+                                break
                             recipient_block.append(next_line)
                     if recipient_block:
                         recipient_text = '\n'.join(recipient_block)
                         recipient_start_idx = i + len(recipient_block) + 1
+                        # For receipts, there's often no traditional "sender", so skip sender detection
+                        sender_text = None
                     break
-        
-        # Strategy 2: If no explicit indicator, look for "Dear..." and take preceding address block
-        if not recipient_text:
-            for i, line in enumerate(remaining_lines[:30]):
-                line_stripped = line.strip()
-                if line_stripped.lower().startswith('dear '):
-                    # Found "Dear", collect preceding non-empty lines (likely recipient)
-                    temp_block = []
-                    for j in range(i-1, -1, -1):
-                        prev_line = remaining_lines[j].strip()
-                        if prev_line:
-                            temp_block.insert(0, prev_line)
-                        elif temp_block:  # Hit empty line after collecting some lines
-                            break
-                    
-                    if temp_block and len(temp_block) >= 2:  # At least name + address
-                        recipient_text = '\n'.join(temp_block)
-                        recipient_start_idx = i + 1
-                    else:
-                        # No clear recipient block, body starts at "Dear"
-                        recipient_start_idx = i
-                    break
+            
+            # Strategy 1: Look for explicit indicators ("To:", "Re:")
+            if not recipient_text:
+                recipient_block = []  # Reset block
+                for i, line in enumerate(remaining_lines[:20]):
+                    line_stripped = line.strip()
+                    if 'to:' in line_stripped.lower() or 're:' in line_stripped.lower():
+                        # Found indicator, collect next few lines
+                        for j in range(i+1, min(i+6, len(remaining_lines))):
+                            next_line = remaining_lines[j].strip()
+                            if next_line:
+                                recipient_block.append(next_line)
+                        if recipient_block:
+                            recipient_text = '\n'.join(recipient_block)
+                            recipient_start_idx = i + len(recipient_block) + 1
+                        break
+            
+            # Strategy 2: If no explicit indicator, look for "Dear..." and take preceding address block
+            # (This is now less relevant since we handle "Dear" earlier, but keep as fallback)
+            if not recipient_text:
+                for i, line in enumerate(remaining_lines[:30]):
+                    line_stripped = line.strip()
+                    if line_stripped.lower().startswith('dear '):
+                        # Found "Dear", collect preceding non-empty lines (likely recipient)
+                        temp_block = []
+                        for j in range(i-1, -1, -1):
+                            prev_line = remaining_lines[j].strip()
+                            if prev_line:
+                                temp_block.insert(0, prev_line)
+                            elif temp_block:  # Hit empty line after collecting some lines
+                                break
+                        
+                        if temp_block and len(temp_block) >= 2:  # At least name + address
+                            recipient_text = '\n'.join(temp_block)
+                            recipient_start_idx = i + 1
+                        else:
+                            # No clear recipient block, body starts at "Dear"
+                            recipient_start_idx = i
+                        break
         
         # Calculate body start position
         if recipient_start_idx is not None:
@@ -332,12 +428,26 @@ class DocumentParser:
         else:
             raise ValueError(f"Unsupported file type: {path.suffix}")
         
+        # Debug output (only if enabled)
+        if DEBUG_PARSING:
+            logger.debug(f"📄 Extracted text preview:\n{raw_text[:1000]}\n...")
+        
         # Parse into blocks
         sender_text, recipient_text, body_text = self.parse_document_blocks(raw_text)
+        
+        # Debug output (only if enabled)
+        if DEBUG_PARSING:
+            logger.debug(f"📦 Sender block: {sender_text[:300] if sender_text else 'None'}")
+            logger.debug(f"📦 Recipient block: {recipient_text[:300] if recipient_text else 'None'}")
         
         # Extract structured data
         parsed_sender = self.extract_structured_data(sender_text, "sender") if sender_text else {}
         parsed_recipient = self.extract_structured_data(recipient_text, "recipient") if recipient_text else {}
+        
+        # Debug output (only if enabled)
+        if DEBUG_PARSING:
+            logger.debug(f"📊 Parsed sender: {parsed_sender}")
+            logger.debug(f"📊 Parsed recipient: {parsed_recipient}")
         
         return {
             'raw_text': raw_text,

@@ -106,3 +106,61 @@ Without the key:
 ⚠️ OPENAI_API_KEY not set. LLM parsing unavailable.
 ```
 
+## Development & Debugging Options
+
+### Logging
+
+All document parsing activity is logged to `backend/logs/document_parsing_YYYYMMDD.log` with:
+- Text extraction steps
+- LLM interactions
+- Block detection decisions
+- Field extraction results
+- Validation checks
+
+### Debug Mode
+
+Enable detailed debug output:
+```bash
+DEBUG_DOCUMENT_PARSING=true
+```
+
+This adds verbose logging including:
+- Full extracted text previews
+- Parsed block contents
+- Structured data details
+
+### LLM Validation
+
+Control whether LLM outputs are validated against source text:
+```bash
+VALIDATE_LLM_EXTRACTIONS=true  # Default: enabled (recommended)
+```
+
+When enabled, rejects hallucinated data (addresses not in source text).
+Disable for testing to see raw LLM outputs.
+
+### Example .env for Development
+
+```bash
+# LLM Provider
+LLM_PROVIDER=ollama  # or "openai"
+OLLAMA_MODEL=llama3.2:1b
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Development Options
+DEBUG_DOCUMENT_PARSING=true
+VALIDATE_LLM_EXTRACTIONS=true
+```
+
+## Testing & Evaluation
+
+See `backend/testing/README.md` for the evaluation framework documentation.
+
+Quick start:
+```bash
+cd backend
+python -m testing.document_eval
+```
+
+This runs systematic tests and generates reports for quality tracking.
+

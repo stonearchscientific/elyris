@@ -2,6 +2,13 @@
 import os
 import json
 from typing import Dict, Any, Optional, Tuple
+from .logging_config import setup_logger
+
+logger = setup_logger(__name__)
+
+# Debug mode controlled by environment variable
+DEBUG_PARSING = os.getenv('DEBUG_DOCUMENT_PARSING', 'false').lower() == 'true'
+VALIDATE_EXTRACTIONS = os.getenv('VALIDATE_LLM_EXTRACTIONS', 'true').lower() == 'true'
 
 # Lazy import for OpenAI
 _OPENAI_AVAILABLE = None
@@ -38,7 +45,7 @@ class LLMDocumentParser:
             self.ollama_model = os.getenv('OLLAMA_MODEL', 'llama3.2')
             self.available = self._check_ollama_available()
             if self.available:
-                print(f"✅ Ollama enabled: {self.ollama_model}", flush=True)
+                logger.info(f"✅ Ollama enabled: {self.ollama_model}")
         else:  # openai
             self.api_key = api_key or os.getenv('OPENAI_API_KEY')
             self.available = _check_openai() and self.api_key is not None
@@ -132,18 +139,18 @@ Return ONLY valid JSON, no explanation."""
             # Validate that sender/recipient are strings (or None), not dicts
             # LLM sometimes ignores instructions and returns nested JSON
             if sender and not isinstance(sender, str):
-                print(f"⚠️ LLM returned non-string sender_text (type: {type(sender).__name__}), ignoring", flush=True)
+                logger.warning(f"LLM returned non-string sender_text (type: {type(sender).__name__}), ignoring")
                 sender = None
             if recipient and not isinstance(recipient, str):
-                print(f"⚠️ LLM returned non-string recipient_text (type: {type(recipient).__name__}), ignoring", flush=True)
+                logger.warning(f"LLM returned non-string recipient_text (type: {type(recipient).__name__}), ignoring")
                 recipient = None
             
-            print(f"✓ LLM parsing complete: sender={'found' if sender else 'not found'}, recipient={'found' if recipient else 'not found'}", flush=True)
+            logger.info(f"✓ LLM parsing complete: sender={'found' if sender else 'not found'}, recipient={'found' if recipient else 'not found'}")
             
             return sender, recipient, body
             
         except Exception as e:
-            print(f"⚠️ LLM parsing failed: {str(e)}", flush=True)
+            logger.warning(f"LLM parsing failed: {str(e)}")
             return None, None, text
     
     def _post_process_extraction(self, result: Dict[str, Any], text: str, block_type: str) -> Dict[str, Any]:
@@ -209,6 +216,51 @@ Return ONLY valid JSON, no explanation."""
                             break
         
         return result
+    
+    def _validate_extraction(self, result: Dict[str, Any], source_text: str) -> Dict[str, Any]:
+        """
+        Validate extracted data against source text to prevent hallucinations
+        Remove fields that don't appear in the source
+        """
+        validated = {}
+        source_lower = source_text.lower()
+        
+        for key, value in result.items():
+            if value is None:
+                continue
+                
+            # Check if the value actually appears in the source text
+            value_lower = str(value).lower()
+            
+            # For addresses, zip codes, phone numbers - must be verbatim in source
+            if key in ['address', 'zip', 'phone', 'email']:
+                # For zip codes, be flexible with formatting (55164-0989 vs 55164 -0989)
+                if key == 'zip':
+                    zip_normalized = value_lower.replace(' ', '').replace('-', '')
+                    source_normalized = source_lower.replace(' ', '').replace('-', '')
+                    if zip_normalized in source_normalized:
+                        validated[key] = value
+                        continue
+                
+                # For others, check verbatim presence (with some flexibility for whitespace)
+                if value_lower in source_lower or value_lower.replace(' ', '') in source_lower.replace(' ', ''):
+                    validated[key] = value
+                else:
+                    logger.debug(f"Rejecting hallucinated {key}: '{value}' not found in source")
+            
+            # For names, cities, states, organizations - be more lenient (might have OCR artifacts)
+            elif key in ['first_name', 'last_name', 'city', 'state', 'organization_name', 'department']:
+                # Check if at least part of it appears (handle OCR spacing like "St. Paul" vs "St . Paul")
+                value_parts = value_lower.split()
+                if any(part in source_lower for part in value_parts if len(part) > 2):
+                    validated[key] = value
+                else:
+                    logger.debug(f"Rejecting hallucinated {key}: '{value}' not found in source")
+            else:
+                # Other fields - keep as is
+                validated[key] = value
+        
+        return validated
     
     def extract_structured_with_llm(self, text_block: str, block_type: str) -> Dict[str, Any]:
         """
@@ -286,14 +338,18 @@ Return ONLY valid JSON with NO nested objects."""
             # Post-processing: Fill in missing fields using regex if LLM returned null
             result = self._post_process_extraction(result, text_block, block_type)
             
+            # Validation: Remove hallucinated data (fields not found in source text)
+            if VALIDATE_EXTRACTIONS:
+                result = self._validate_extraction(result, text_block)
+            
             # Remove None values
             result = {k: v for k, v in result.items() if v is not None}
             
-            print(f"✓ LLM extracted {len(result)} fields from {block_type}", flush=True)
+            logger.info(f"✓ LLM extracted {len(result)} fields from {block_type}")
             
             return result
             
         except Exception as e:
-            print(f"⚠️ LLM field extraction failed for {block_type}: {str(e)}", flush=True)
+            logger.error(f"LLM field extraction failed for {block_type}: {str(e)}")
             return {}
 
