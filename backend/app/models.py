@@ -23,6 +23,7 @@ class GlobalPosition(SQLModel, table=True):
 class Location(SQLModel, table=True):
     id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     name: str
+    department: Optional[str] = None  # Department/division within organization
     address: Optional[str] = None
     city: Optional[str] = None
     state: Optional[str] = None

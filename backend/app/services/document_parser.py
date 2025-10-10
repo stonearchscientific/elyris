@@ -182,23 +182,50 @@ class DocumentParser:
                     body_start = i + 1
                     break
         
-        # Look for recipient indicators ("To:", name followed by address)
+        # Look for recipient using multiple strategies
         remaining_lines = lines[body_start:]
         recipient_block = []
-        found_recipient = False
+        recipient_start_idx = None
         
+        # Strategy 1: Look for explicit indicators ("To:", "Re:")
         for i, line in enumerate(remaining_lines[:20]):
-            line = line.strip()
-            if not found_recipient and ('to:' in line.lower() or 're:' in line.lower()):
-                found_recipient = True
-                continue
-            
-            if found_recipient and line:
-                recipient_block.append(line)
-                if len(recipient_block) >= 4:  # Take next 4 lines after indicator
+            line_stripped = line.strip()
+            if 'to:' in line_stripped.lower() or 're:' in line_stripped.lower():
+                # Found indicator, collect next few lines
+                for j in range(i+1, min(i+6, len(remaining_lines))):
+                    next_line = remaining_lines[j].strip()
+                    if next_line:
+                        recipient_block.append(next_line)
+                if recipient_block:
                     recipient_text = '\n'.join(recipient_block)
-                    body_start += i + 1
+                    recipient_start_idx = i + len(recipient_block) + 1
+                break
+        
+        # Strategy 2: If no explicit indicator, look for "Dear..." and take preceding address block
+        if not recipient_text:
+            for i, line in enumerate(remaining_lines[:30]):
+                line_stripped = line.strip()
+                if line_stripped.lower().startswith('dear '):
+                    # Found "Dear", collect preceding non-empty lines (likely recipient)
+                    temp_block = []
+                    for j in range(i-1, -1, -1):
+                        prev_line = remaining_lines[j].strip()
+                        if prev_line:
+                            temp_block.insert(0, prev_line)
+                        elif temp_block:  # Hit empty line after collecting some lines
+                            break
+                    
+                    if temp_block and len(temp_block) >= 2:  # At least name + address
+                        recipient_text = '\n'.join(temp_block)
+                        recipient_start_idx = i + 1
+                    else:
+                        # No clear recipient block, body starts at "Dear"
+                        recipient_start_idx = i
                     break
+        
+        # Calculate body start position
+        if recipient_start_idx is not None:
+            body_start += recipient_start_idx
         
         # Rest is body text
         body_text = '\n'.join(lines[body_start:]).strip()

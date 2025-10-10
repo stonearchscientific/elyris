@@ -44,6 +44,41 @@ class SmartQueryService:
         self.model = None  # Lazy load
         self.similarity_threshold = 0.75  # Configurable threshold
     
+    def _normalize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize nested data structures to flat strings for SQL queries
+        
+        Handles cases where parsed data might have nested dicts like:
+        {'address': {'street': '...', 'city': '...'}} → {'address': '...', 'city': '...'}
+        
+        Also handles remapping common variations:
+        - 'street_address' → 'address'
+        - 'organization_name' → used for 'name' field
+        """
+        normalized = {}
+        
+        for key, value in data.items():
+            if isinstance(value, dict):
+                # Flatten nested dict - merge into parent
+                for nested_key, nested_value in value.items():
+                    if isinstance(nested_value, str):
+                        # Remap street_address to address
+                        if nested_key == 'street_address':
+                            normalized['address'] = nested_value
+                        else:
+                            normalized[nested_key] = nested_value
+            elif isinstance(value, str):
+                # Handle key remapping
+                if key == 'street_address':
+                    normalized['address'] = value
+                elif key == 'organization_name':
+                    normalized['name'] = value  # Map to Location.name field
+                else:
+                    normalized[key] = value
+            # Skip non-string, non-dict values
+        
+        return normalized
+    
     def _get_model(self):
         """Lazy load the sentence transformer model"""
         if not _check_sentence_transformers():
@@ -89,11 +124,13 @@ class SmartQueryService:
         """
         query = select(Person)
         
-        # Build query based on available fields
+        # Build query based on available fields (case-insensitive)
         if 'first_name' in data and 'last_name' in data:
+            # Use case-insensitive comparison via func.lower()
+            from sqlalchemy import func
             query = query.where(
-                Person.first_name == data['first_name'],
-                Person.last_name == data['last_name']
+                func.lower(Person.first_name) == data['first_name'].lower(),
+                func.lower(Person.last_name) == data['last_name'].lower()
             )
             
             # If DOB is available, use it for stronger match
@@ -159,6 +196,9 @@ class SmartQueryService:
         Returns:
             person_id if match found/created, None if queued for review
         """
+        # Normalize data to flatten nested structures
+        data = self._normalize_data(data)
+        
         # Step 1: Try deterministic match
         person = self.match_person_deterministic(data)
         if person:
@@ -296,6 +336,9 @@ class SmartQueryService:
         Returns:
             location_id if match found/created, None if queued for review
         """
+        # Normalize data to flatten nested structures
+        data = self._normalize_data(data)
+        
         # Step 1: Try deterministic match
         location = self.match_location_deterministic(data)
         if location:
