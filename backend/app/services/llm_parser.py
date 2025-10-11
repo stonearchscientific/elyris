@@ -9,9 +9,10 @@ logger = setup_logger(__name__)
 # Debug mode controlled by environment variable
 DEBUG_PARSING = os.getenv('DEBUG_DOCUMENT_PARSING', 'false').lower() == 'true'
 VALIDATE_EXTRACTIONS = os.getenv('VALIDATE_LLM_EXTRACTIONS', 'true').lower() == 'true'
+TOKEN_LIMIT = int(os.getenv('TOKEN_LIMIT', '4000'))
 
 # Import models to get schema fields
-from backend.app.models import Person, Location
+from backend.app.models import Person, Location, Document
 
 def _get_person_fields() -> List[str]:
     """Extract field names from Person model for prompting"""
@@ -24,6 +25,19 @@ def _get_location_fields() -> List[str]:
     # Exclude internal fields
     exclude = {'id', 'created_at', 'updated_at', 'global_position_id'}
     return [field for field in Location.model_fields.keys() if field not in exclude]
+
+def _get_doc_type_categories() -> Dict[str, str]:
+    """
+    Map document type categories to domains
+    
+    Returns:
+        Dict mapping doc_type to domain abbreviation
+    """
+    return {
+        "financial": "ERP",  # Enterprise Resource Planning (invoices, receipts, quotes)
+        "health": "EHR",     # Electronic Health Records (medical letters, claims)
+        "education": "LMS"   # Learning Management System (IEPs, school letters)
+    }
 
 # Lazy import for OpenAI
 _OPENAI_AVAILABLE = None
@@ -108,53 +122,62 @@ class LLMDocumentParser:
             )
             return response.choices[0].message.content.strip()
     
-    def parse_document_with_llm(self, text: str) -> Tuple[Optional[str], Optional[str], str]:
+    def parse_document_with_llm(self, text: str, filename_hints: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
         """
-        Use LLM to intelligently identify text blocks for Person and Location entities
+        Use LLM to intelligently identify document type and text blocks for entities
+        
+        Args:
+            text: Document text to parse
+            filename_hints: Optional hints from filename (keywords, suggested_type, person_name)
         
         Returns:
-            Tuple of (sender_text, recipient_text, body_text) for backward compatibility
+            Tuple of (sender_text, recipient_text, body_text, doc_type)
             sender_text = FROM entity block (typically Location for organizations)
             recipient_text = TO entity block (typically Person)
+            doc_type = Document category: "financial", "health", "education", or default
         """
         if not self.available:
-            return None, None, text
+            return None, None, text, None
         
         try:
-            person_fields = _get_person_fields()
-            location_fields = _get_location_fields()
+            # Smart sampling: First 500 + Last 500 chars for SLMs
+            # This captures letterhead (top) and signatures (bottom) better than middle text
+            sample_size = min(500, len(text) // 2)
+            if len(text) > TOKEN_LIMIT:
+                text_sample = text[:sample_size] + "\n...\n" + text[-sample_size:]
+                logger.debug(f"[SAMPLING] Using first {sample_size} + last {sample_size} chars")
+            else:
+                text_sample = text
             
-            prompt = f"""You are a document processing assistant. Analyze this document and identify text blocks containing entity information.
+            # Build context from filename hints
+            context_lines = []
+            if filename_hints:
+                if filename_hints.get('suggested_type'):
+                    context_lines.append(f"Filename suggests type: {filename_hints['suggested_type']}")
+                if filename_hints.get('person_name'):
+                    context_lines.append(f"Likely for person: {filename_hints['person_name']}")
+                if filename_hints.get('keywords'):
+                    context_lines.append(f"Keywords: {', '.join(filename_hints['keywords'])}")
+            
+            context_hint = "\n".join(context_lines) if context_lines else "No filename hints available."
+            
+            prompt = f"""Document parsing task.
 
-ENTITY TYPES TO EXTRACT:
+CONTEXT FROM FILENAME:
+{context_hint}
 
-1. **LOCATION entities** (organizations, businesses, government agencies):
-   - Fields: {', '.join(location_fields)}
-   - Usually: Letterhead, return address, company info, organization names
-   
-2. **PERSON entities** (individual people):
-   - Fields: {', '.join(person_fields)}
-   - Usually: Recipient name/address, "To:", "Attention:", individual contacts
+TASK:
+1. doc_type: "financial", "health", or "education"
+2. from_block: Organization/letterhead text (who sent this)
+3. to_block: Person/recipient text (who receives this)
+4. body_text: Main content
 
-3. **BODY**: Main document content (letters, body text, transaction details)
+Copy exact text from document. Use null if not found.
 
-INSTRUCTIONS:
-- Return the raw text blocks where these entities appear
-- For "FROM" (sender), look for letterhead/return address → typically a LOCATION
-- For "TO" (recipient), look for addressee → typically a PERSON
-- If document has contact signatures, that's also a PERSON entity
+DOCUMENT TEXT:
+{text_sample}
 
-Return JSON:
-{{
-  "from_block": "raw text of FROM entity (sender)",
-  "to_block": "raw text of TO entity (recipient)",
-  "body_text": "main content"
-}}
-
-Document text:
-{text[:4000]}
-
-Return ONLY valid JSON, no explanation."""
+Return JSON: {{"doc_type": "...", "from_block": "...", "to_block": "...", "body_text": "..."}}"""
 
             result_text = self._call_llm(prompt, "You are a precise document parser. Return only valid JSON.")
             
@@ -168,9 +191,16 @@ Return ONLY valid JSON, no explanation."""
             
             result = json.loads(result_text.strip())
             
+            doc_type = result.get('doc_type', 'financial')  # Default to financial if not specified
             from_block = result.get('from_block')
             to_block = result.get('to_block')
             body = result.get('body_text', text)
+            
+            # Validate doc_type
+            valid_types = list(_get_doc_type_categories().keys())
+            if doc_type not in valid_types:
+                logger.warning(f"Invalid doc_type '{doc_type}', defaulting to 'financial'")
+                doc_type = 'financial'
             
             # Validate that blocks are strings (or None), not dicts
             if from_block and not isinstance(from_block, str):
@@ -180,14 +210,16 @@ Return ONLY valid JSON, no explanation."""
                 logger.warning(f"LLM returned non-string to_block (type: {type(to_block).__name__}), ignoring")
                 to_block = None
             
-            logger.info(f"[LLM] Block detection: from={'found' if from_block else 'not found'}, to={'found' if to_block else 'not found'}")
+            # Map doc_type to domain
+            domain = _get_doc_type_categories()[doc_type]
+            logger.info(f"[LLM] Document type: {doc_type} ({domain}), blocks: from={'found' if from_block else 'not found'}, to={'found' if to_block else 'not found'}")
             
-            # Return as (sender, recipient, body) for backward compatibility
-            return from_block, to_block, body
+            # Return sender, recipient, body, doc_type
+            return from_block, to_block, body, doc_type
             
         except Exception as e:
             logger.warning(f"LLM block detection failed: {str(e)}")
-            return None, None, text
+            return None, None, text, None
     
     def _post_process_extraction(self, result: Dict[str, Any], text: str, block_type: str) -> Dict[str, Any]:
         """

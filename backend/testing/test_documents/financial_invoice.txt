@@ -1,0 +1,31 @@
+ACME TREE SERVICES
+Professional Landscaping Division
+1234 Oak Street
+Minneapolis, MN 55401
+Phone: (612) 555-1234
+Email: billing@acmetree.com
+
+INVOICE #INV-2024-001
+Date: October 10, 2024
+
+BILL TO:
+John Smith
+456 Maple Avenue
+St. Paul, MN 55102
+
+DESCRIPTION                          AMOUNT
+--------------------------------------------
+Tree Trimming - Front Yard          $450.00
+Stump Removal                       $275.00
+Cleanup & Disposal                  $125.00
+--------------------------------------------
+SUBTOTAL                            $850.00
+TAX (7.5%)                           $63.75
+--------------------------------------------
+TOTAL DUE                           $913.75
+
+Payment due within 30 days.
+Thank you for your business!
+
+Questions? Contact Sarah Johnson at sarah@acmetree.com
+

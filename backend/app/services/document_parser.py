@@ -10,6 +10,54 @@ logger = setup_logger(__name__)
 # Debug mode controlled by environment variable
 DEBUG_PARSING = os.getenv('DEBUG_DOCUMENT_PARSING', 'false').lower() == 'true'
 
+def extract_filename_hints(file_path: str) -> Dict[str, Any]:
+    """
+    Extract helpful context from filename for guiding LLM parsing
+    
+    Args:
+        file_path: Path to document file
+    
+    Returns:
+        Dict with keywords, suggested_type, and person_name hints
+    """
+    path = Path(file_path)
+    filename = path.stem.lower()  # Remove extension
+    
+    # Common document type keywords
+    financial_keywords = ['invoice', 'receipt', 'quote', 'bill', 'payment', 'transaction', 'purchase', 'financial']
+    health_keywords = ['health', 'medical', 'insurance', 'benefits', 'care', 'claim', 'hospital', 'doctor', 'clinic']
+    education_keywords = ['school', 'iep', 'education', 'academic', 'grade', 'student', 'class', 'elementary', 'learning']
+    
+    # Extract keywords from filename
+    keywords = []
+    suggested_type = None
+    
+    for keyword in financial_keywords:
+        if keyword in filename:
+            keywords.append(keyword)
+            suggested_type = 'financial'
+    
+    for keyword in health_keywords:
+        if keyword in filename:
+            keywords.append(keyword)
+            suggested_type = 'health'
+    
+    for keyword in education_keywords:
+        if keyword in filename:
+            keywords.append(keyword)
+            suggested_type = 'education'
+    
+    # Try to extract person name (often first part before underscore)
+    parts = filename.split('_')
+    person_name = parts[0] if parts and len(parts[0]) > 2 else None
+    
+    return {
+        'keywords': keywords,
+        'suggested_type': suggested_type,
+        'person_name': person_name.title() if person_name else None,
+        'filename': path.name
+    }
+
 # Lazy imports for optional OCR dependencies
 _PIL_AVAILABLE = None
 _PYTESSERACT_AVAILABLE = None
@@ -75,9 +123,9 @@ class DocumentParser:
                 from backend.app.services.llm_parser import LLMDocumentParser
                 self.llm_parser = LLMDocumentParser()
                 if self.llm_parser.available:
-                    print("✅ LLM-based parsing enabled", flush=True)
+                    logger.info("[INIT] LLM-based parsing enabled")
             except Exception as e:
-                print(f"⚠️ Could not initialize LLM parser: {e}", flush=True)
+                logger.warning(f"Could not initialize LLM parser: {e}")
     
     def extract_text_from_image(self, image_path: str) -> str:
         """Extract text from image using OCR"""
@@ -154,20 +202,27 @@ class DocumentParser:
         except Exception as e:
             raise ValueError(f"Error extracting text from PDF: {str(e)}")
     
-    def parse_document_blocks(self, text: str) -> Tuple[Optional[str], Optional[str], str]:
+    def parse_document_blocks(self, text: str, filename_hints: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
         """
-        Parse document into sender, recipient, and body sections
+        Parse document into sender, recipient, and body sections, plus document type
         Uses LLM if available, falls back to heuristic parsing
         
+        Args:
+            text: Document text to parse
+            filename_hints: Optional hints from filename (keywords, suggested_type, person_name)
+        
         Returns:
-            Tuple of (sender_text, recipient_text, body_text)
+            Tuple of (sender_text, recipient_text, body_text, doc_type)
+            doc_type will be None if heuristics are used (can't determine type)
         """
         # Try LLM parsing first
+        detected_doc_type = None
         if self.llm_parser and self.llm_parser.available:
-            sender, recipient, body = self.llm_parser.parse_document_with_llm(text)
-            if sender or recipient:  # If LLM found something, use it
-                return sender, recipient, body
-            logger.info("[FALLBACK] LLM didn't find sender/recipient, using heuristics")
+            sender, recipient, body, doc_type = self.llm_parser.parse_document_with_llm(text, filename_hints)
+            detected_doc_type = doc_type  # Preserve doc_type even if blocks not found
+            if sender or recipient:  # If LLM found blocks, use them
+                return sender, recipient, body, doc_type
+            logger.info(f"[FALLBACK] LLM found type={doc_type} but no blocks, using heuristics for blocks")
         
         # Fall back to heuristic parsing
         lines = text.strip().split('\n')
@@ -351,7 +406,8 @@ class DocumentParser:
         if sender_text or recipient_text:
             logger.info(f"[HEURISTIC] Block detection completed")
         
-        return sender_text, recipient_text, body_text
+        # Return blocks with preserved doc_type (from LLM if available, otherwise None)
+        return sender_text, recipient_text, body_text, detected_doc_type
     
     def extract_structured_data(self, text: str, block_type: str = "unknown") -> Dict[str, Any]:
         """
@@ -424,11 +480,21 @@ class DocumentParser:
         """
         path = Path(file_path)
         
+        # Extract hints from filename to help LLM
+        filename_hints = extract_filename_hints(file_path)
+        if filename_hints['keywords'] or filename_hints['person_name']:
+            logger.info(f"[HINTS] File: {filename_hints['filename']}, Type: {filename_hints['suggested_type']}, Person: {filename_hints['person_name']}")
+        
         # Extract text based on file type
         if path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']:
             raw_text = self.extract_text_from_image(file_path)
         elif path.suffix.lower() == '.pdf':
             raw_text = self.extract_text_from_pdf(file_path)
+        elif path.suffix.lower() == '.txt':
+            # Support plain text for testing
+            with open(file_path, 'r', encoding='utf-8') as f:
+                raw_text = f.read()
+            logger.info(f"[TXT] Loaded {len(raw_text)} chars from text file")
         else:
             raise ValueError(f"Unsupported file type: {path.suffix}")
         
@@ -436,8 +502,8 @@ class DocumentParser:
         if DEBUG_PARSING:
             logger.debug(f"📄 Extracted text preview:\n{raw_text[:1000]}\n...")
         
-        # Parse into blocks
-        sender_text, recipient_text, body_text = self.parse_document_blocks(raw_text)
+        # Parse into blocks with filename hints
+        sender_text, recipient_text, body_text, doc_type = self.parse_document_blocks(raw_text, filename_hints)
         
         # Debug output (only if enabled)
         if DEBUG_PARSING:
@@ -459,6 +525,7 @@ class DocumentParser:
             'recipient_text': recipient_text,
             'body_text': body_text,
             'parsed_sender': parsed_sender,
-            'parsed_recipient': parsed_recipient
+            'parsed_recipient': parsed_recipient,
+            'doc_type': doc_type  # Document category: financial, health, education
         }
 

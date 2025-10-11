@@ -112,3 +112,4 @@ Detailed parsing logs are written to `backend/logs/document_parsing_YYYYMMDD.log
 3. **Review logs**: Check `backend/logs/` for detailed traces
 4. **Compare reports**: Track F1 scores across iterations
 
+
