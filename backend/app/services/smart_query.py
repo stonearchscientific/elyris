@@ -2,11 +2,45 @@
 from typing import Dict, Any, List, Optional, Tuple
 from sqlmodel import Session, select
 from sqlalchemy import func
+from datetime import date, datetime
 
 from backend.app.models import Person, Location, ReviewQueueItem, DocumentParse
 from .logging_config import setup_logger
 
 logger = setup_logger(__name__)
+
+def _parse_date(date_value: Any) -> Optional[date]:
+    """
+    Parse date from various formats to Python date object
+    
+    Args:
+        date_value: String (YYYY-MM-DD), datetime, or date object
+    
+    Returns:
+        Python date object or None if parsing fails
+    """
+    if date_value is None:
+        return None
+    
+    if isinstance(date_value, date):
+        return date_value
+    
+    if isinstance(date_value, datetime):
+        return date_value.date()
+    
+    if isinstance(date_value, str):
+        try:
+            # Try parsing YYYY-MM-DD format
+            return datetime.strptime(date_value, '%Y-%m-%d').date()
+        except ValueError:
+            try:
+                # Try parsing MM/DD/YYYY format
+                return datetime.strptime(date_value, '%m/%d/%Y').date()
+            except ValueError:
+                logger.warning(f"Could not parse date: {date_value}")
+                return None
+    
+    return None
 
 # Lazy import for optional dependencies
 _SENTENCE_TRANSFORMER_AVAILABLE = None
@@ -217,15 +251,18 @@ class SmartQueryService:
         elif len(semantic_matches) == 0:
             # No results - create new person
             if data.get('first_name') and data.get('last_name'):
+                # Parse DOB if present (convert string to date object)
+                dob_value = _parse_date(data.get('dob'))
+                
                 new_person = Person(
                     first_name=data['first_name'],
                     last_name=data['last_name'],
-                    dob=data.get('dob')
+                    dob=dob_value
                 )
                 self.session.add(new_person)
                 self.session.commit()
                 self.session.refresh(new_person)
-                logger.info(f"✅ Created new Person: {new_person.first_name} {new_person.last_name} (ID: {new_person.id})")
+                logger.info(f"[CREATE] New Person: {new_person.first_name} {new_person.last_name} (ID: {new_person.id})")
                 return new_person.id
             else:
                 # Insufficient data to create person - queue for review

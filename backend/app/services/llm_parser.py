@@ -1,7 +1,7 @@
 """LLM-based document parsing for intelligent field extraction"""
 import os
 import json
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from .logging_config import setup_logger
 
 logger = setup_logger(__name__)
@@ -9,6 +9,21 @@ logger = setup_logger(__name__)
 # Debug mode controlled by environment variable
 DEBUG_PARSING = os.getenv('DEBUG_DOCUMENT_PARSING', 'false').lower() == 'true'
 VALIDATE_EXTRACTIONS = os.getenv('VALIDATE_LLM_EXTRACTIONS', 'true').lower() == 'true'
+
+# Import models to get schema fields
+from backend.app.models import Person, Location
+
+def _get_person_fields() -> List[str]:
+    """Extract field names from Person model for prompting"""
+    # Exclude internal fields
+    exclude = {'id', 'created_at', 'legal_flags'}
+    return [field for field in Person.model_fields.keys() if field not in exclude]
+
+def _get_location_fields() -> List[str]:
+    """Extract field names from Location model for prompting"""
+    # Exclude internal fields
+    exclude = {'id', 'created_at', 'updated_at', 'global_position_id'}
+    return [field for field in Location.model_fields.keys() if field not in exclude]
 
 # Lazy import for OpenAI
 _OPENAI_AVAILABLE = None
@@ -45,7 +60,7 @@ class LLMDocumentParser:
             self.ollama_model = os.getenv('OLLAMA_MODEL', 'llama3.2')
             self.available = self._check_ollama_available()
             if self.available:
-                logger.info(f"✅ Ollama enabled: {self.ollama_model}")
+                logger.info(f"[OK] Ollama enabled: {self.ollama_model}")
         else:  # openai
             self.api_key = api_key or os.getenv('OPENAI_API_KEY')
             self.available = _check_openai() and self.api_key is not None
@@ -95,25 +110,46 @@ class LLMDocumentParser:
     
     def parse_document_with_llm(self, text: str) -> Tuple[Optional[str], Optional[str], str]:
         """
-        Use LLM to intelligently extract sender, recipient, and body from document text
+        Use LLM to intelligently identify text blocks for Person and Location entities
         
         Returns:
-            Tuple of (sender_text, recipient_text, body_text)
+            Tuple of (sender_text, recipient_text, body_text) for backward compatibility
+            sender_text = FROM entity block (typically Location for organizations)
+            recipient_text = TO entity block (typically Person)
         """
         if not self.available:
             return None, None, text
         
         try:
-            prompt = f"""You are a document processing assistant. Analyze the following document text and extract:
+            person_fields = _get_person_fields()
+            location_fields = _get_location_fields()
+            
+            prompt = f"""You are a document processing assistant. Analyze this document and identify text blocks containing entity information.
 
-1. SENDER information (usually organization in top left corner or letterhead)
-2. RECIPIENT information (usually person's name and address, may have "To:" or "Re:" prefix)
-3. BODY text (main content of the document)
+ENTITY TYPES TO EXTRACT:
 
-Return a JSON object with these keys:
-- "sender_text": The raw text block containing sender info (or null if not found)
-- "recipient_text": The raw text block containing recipient info (or null if not found)  
-- "body_text": The main document content
+1. **LOCATION entities** (organizations, businesses, government agencies):
+   - Fields: {', '.join(location_fields)}
+   - Usually: Letterhead, return address, company info, organization names
+   
+2. **PERSON entities** (individual people):
+   - Fields: {', '.join(person_fields)}
+   - Usually: Recipient name/address, "To:", "Attention:", individual contacts
+
+3. **BODY**: Main document content (letters, body text, transaction details)
+
+INSTRUCTIONS:
+- Return the raw text blocks where these entities appear
+- For "FROM" (sender), look for letterhead/return address → typically a LOCATION
+- For "TO" (recipient), look for addressee → typically a PERSON
+- If document has contact signatures, that's also a PERSON entity
+
+Return JSON:
+{{
+  "from_block": "raw text of FROM entity (sender)",
+  "to_block": "raw text of TO entity (recipient)",
+  "body_text": "main content"
+}}
 
 Document text:
 {text[:4000]}
@@ -132,25 +168,25 @@ Return ONLY valid JSON, no explanation."""
             
             result = json.loads(result_text.strip())
             
-            sender = result.get('sender_text')
-            recipient = result.get('recipient_text')
+            from_block = result.get('from_block')
+            to_block = result.get('to_block')
             body = result.get('body_text', text)
             
-            # Validate that sender/recipient are strings (or None), not dicts
-            # LLM sometimes ignores instructions and returns nested JSON
-            if sender and not isinstance(sender, str):
-                logger.warning(f"LLM returned non-string sender_text (type: {type(sender).__name__}), ignoring")
-                sender = None
-            if recipient and not isinstance(recipient, str):
-                logger.warning(f"LLM returned non-string recipient_text (type: {type(recipient).__name__}), ignoring")
-                recipient = None
+            # Validate that blocks are strings (or None), not dicts
+            if from_block and not isinstance(from_block, str):
+                logger.warning(f"LLM returned non-string from_block (type: {type(from_block).__name__}), ignoring")
+                from_block = None
+            if to_block and not isinstance(to_block, str):
+                logger.warning(f"LLM returned non-string to_block (type: {type(to_block).__name__}), ignoring")
+                to_block = None
             
-            logger.info(f"✓ LLM parsing complete: sender={'found' if sender else 'not found'}, recipient={'found' if recipient else 'not found'}")
+            logger.info(f"[LLM] Block detection: from={'found' if from_block else 'not found'}, to={'found' if to_block else 'not found'}")
             
-            return sender, recipient, body
+            # Return as (sender, recipient, body) for backward compatibility
+            return from_block, to_block, body
             
         except Exception as e:
-            logger.warning(f"LLM parsing failed: {str(e)}")
+            logger.warning(f"LLM block detection failed: {str(e)}")
             return None, None, text
     
     def _post_process_extraction(self, result: Dict[str, Any], text: str, block_type: str) -> Dict[str, Any]:
@@ -249,7 +285,7 @@ Return ONLY valid JSON, no explanation."""
                     logger.debug(f"Rejecting hallucinated {key}: '{value}' not found in source")
             
             # For names, cities, states, organizations - be more lenient (might have OCR artifacts)
-            elif key in ['first_name', 'last_name', 'city', 'state', 'organization_name', 'department']:
+            elif key in ['first_name', 'last_name', 'city', 'state', 'organization_name', 'department', 'name']:
                 # Check if at least part of it appears (handle OCR spacing like "St. Paul" vs "St . Paul")
                 value_parts = value_lower.split()
                 if any(part in source_lower for part in value_parts if len(part) > 2):
@@ -264,61 +300,89 @@ Return ONLY valid JSON, no explanation."""
     
     def extract_structured_with_llm(self, text_block: str, block_type: str) -> Dict[str, Any]:
         """
-        Use LLM to extract structured fields from a text block
+        Use LLM to extract structured fields from a text block using SQL schema
         
         Args:
-            text_block: Raw text (sender or recipient block)
-            block_type: "sender" or "recipient"
+            text_block: Raw text containing entity information
+            block_type: "sender" (Location entity) or "recipient" (Person entity)
         
         Returns:
-            Dict with structured fields (name, address, city, state, zip, etc.)
+            Dict with structured fields matching SQL schema
         """
         if not self.available or not text_block:
             return {}
         
         try:
+            # Determine entity type and get schema fields
             if block_type == "sender":
-                prompt = f"""Extract structured information from this sender/organization text block.
+                # Sender is typically a Location (organization)
+                entity_type = "LOCATION"
+                fields = _get_location_fields()
+                field_descriptions = {
+                    "name": "Organization/company name (e.g. 'Minnesota Department of Human Services')",
+                    "department": "Department/division if present (e.g. 'Legislative Mailing')",
+                    "address": "Physical/mailing address - PO Box or street (e.g. 'PO Box 64989')",
+                    "city": "City name",
+                    "state": "2-letter state code",
+                    "zip": "ZIP code (keep hyphen if present)",
+                    "country": "Country if specified",
+                    "phone": "Phone number",
+                    "email": "Email address",
+                    "website": "Website URL"
+                }
+                
+                prompt = f"""Extract {entity_type} entity information from this text block.
+
+DATABASE SCHEMA: {entity_type} table has these fields:
+{chr(10).join(f'- "{field}": {field_descriptions.get(field, "string value")}' for field in fields)}
 
 CRITICAL RULES:
-1. "organization_name" = Company/agency name ONLY (e.g. "Minnesota Department of Human Services")
-2. "department" = Department/division if present (e.g. "Legislative Mailing")
-3. "address" = MAILING address ONLY - look for PO Box or street numbers (e.g. "PO Box 64989" or "123 Main St")
-4. NEVER put organization name in address field
-5. Return FLAT JSON - no nested objects
+1. "name" = Organization name ONLY, NOT address
+2. "address" = MAILING address ONLY (PO Box or street numbers)
+3. NEVER put organization name in address field
+4. Return FLAT JSON matching the schema fields above
+5. Use null for fields not found in the text
 
-Extract these fields (use null if not found):
-- "organization_name": string
-- "department": string
-- "address": string (PO Box or street address ONLY)
-- "city": string
-- "state": string (2 letters)
-- "zip": string (keep hyphen if present)
-- "phone": string
-- "email": string
-
-Text:
+Text block:
 {text_block}
 
 Return ONLY valid JSON with NO nested objects."""
+
             else:  # recipient
-                prompt = f"""Extract structured information from this recipient/person text block.
+                # Recipient is typically a Person
+                entity_type = "PERSON"
+                fields = _get_person_fields()
+                field_descriptions = {
+                    "first_name": "First name only",
+                    "last_name": "Last name only",
+                    "dob": "Date of birth (YYYY-MM-DD format)"
+                }
+                
+                # Note: Person entities might have address info stored elsewhere, but we'll extract it for matching
+                # Add common address fields that appear in person blocks for smart query matching
+                fields.extend(["address", "city", "state", "zip", "phone", "email"])
+                
+                prompt = f"""Extract {entity_type} entity information from this text block.
+
+DATABASE SCHEMA: {entity_type} table has these core fields:
+{chr(10).join(f'- "{field}": {field_descriptions.get(field, "string value")}' for field in _get_person_fields())}
+
+ALSO extract these fields for entity matching (if present):
+- "address": Full street address
+- "city": City name
+- "state": 2-letter state code
+- "zip": ZIP code (keep hyphen if present)
+- "phone": Phone number
+- "email": Email address
 
 CRITICAL RULES:
-1. Look for FULL NAME (first and last) - often appears first as "FIRSTNAME LASTNAME"
-2. "address" = COMPLETE street address including number AND street name (e.g. "1085 Willow View Dr")
-3. "zip" = COMPLETE ZIP code, may have hyphen (e.g. "55356-4304")
-4. Return FLAT JSON - no nested objects
+1. Look for FULL NAME - often appears as "FIRSTNAME LASTNAME"
+2. "address" = COMPLETE street address with number AND street name
+3. "zip" = COMPLETE ZIP code with hyphen if present
+4. Return FLAT JSON matching the schema fields
+5. Use null for fields not found in the text
 
-Extract these fields (use null if not found):
-- "first_name": string (first name only)
-- "last_name": string (last name only)
-- "address": string (FULL street address)
-- "city": string
-- "state": string (2 letters)
-- "zip": string (COMPLETE zip code with hyphen if present)
-
-Text:
+Text block:
 {text_block}
 
 Return ONLY valid JSON with NO nested objects."""
@@ -335,17 +399,46 @@ Return ONLY valid JSON with NO nested objects."""
             
             result = json.loads(result_text.strip())
             
+            # Track which fields came from LLM vs post-processing
+            parsing_methods = {}
+            for key in result:
+                if result[key] is not None:
+                    parsing_methods[key] = "llm"
+            
             # Post-processing: Fill in missing fields using regex if LLM returned null
+            pre_regex_keys = set(k for k, v in result.items() if v is not None)
             result = self._post_process_extraction(result, text_block, block_type)
+            post_regex_keys = set(k for k, v in result.items() if v is not None)
+            
+            # Track fields added by regex
+            regex_added = post_regex_keys - pre_regex_keys
+            for key in regex_added:
+                parsing_methods[key] = "regex"
             
             # Validation: Remove hallucinated data (fields not found in source text)
             if VALIDATE_EXTRACTIONS:
+                pre_validation_keys = set(k for k, v in result.items() if v is not None)
                 result = self._validate_extraction(result, text_block)
+                post_validation_keys = set(k for k, v in result.items() if v is not None)
+                
+                # Track rejected fields
+                rejected_keys = pre_validation_keys - post_validation_keys
+                if rejected_keys:
+                    logger.info(f"Validation rejected fields: {', '.join(rejected_keys)}")
             
             # Remove None values
             result = {k: v for k, v in result.items() if v is not None}
             
-            logger.info(f"✓ LLM extracted {len(result)} fields from {block_type}")
+            # Log extraction summary
+            llm_fields = [k for k, v in parsing_methods.items() if v == "llm" and k in result]
+            regex_fields = [k for k, v in parsing_methods.items() if v == "regex" and k in result]
+            
+            logger.info(f"[LLM] Extracted {len(result)} {entity_type} fields from {block_type}")
+            if DEBUG_PARSING:
+                if llm_fields:
+                    logger.debug(f"  LLM: {', '.join(llm_fields)}")
+                if regex_fields:
+                    logger.debug(f"  Regex: {', '.join(regex_fields)}")
             
             return result
             

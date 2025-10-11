@@ -44,7 +44,9 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.addHandler(file_handler)
     
     # Console handler (simpler, INFO and above)
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Use UTF-8 encoding to handle emoji/special characters on Windows
+    import io
+    console_handler = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace'))
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(simple_formatter)
     logger.addHandler(console_handler)
@@ -54,4 +56,5 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 
 # Module-level logger for evaluation/testing
 eval_logger = setup_logger('document_parsing.eval', level=logging.DEBUG)
+
 

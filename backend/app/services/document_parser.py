@@ -120,10 +120,10 @@ class DocumentParser:
                     
                     if text_parts:
                         extracted_text = "\n\n".join(text_parts)
-                        logger.info(f"✓ Extracted {len(extracted_text)} chars from PDF using direct text extraction")
+                        logger.info(f"[PDF] Extracted {len(extracted_text)} chars from PDF using direct text extraction")
                         return extracted_text
                     else:
-                        logger.info("⚠ No embedded text found in PDF, falling back to OCR...")
+                        logger.info("[PDF] No embedded text found in PDF, falling back to OCR...")
             except Exception as e:
                 logger.warning(f"Direct PDF text extraction failed ({str(e)}), trying OCR...")
         
@@ -137,7 +137,7 @@ class DocumentParser:
             from pdf2image import convert_from_path
             import pytesseract
             
-            logger.info("🔍 Converting PDF to images for OCR...")
+            logger.info("[OCR] Converting PDF to images for OCR...")
             # Convert PDF to images
             images = convert_from_path(pdf_path)
             
@@ -149,7 +149,7 @@ class DocumentParser:
                 logger.debug(f"Processed page {i+1}/{len(images)}")
             
             result = "\n\n".join(full_text)
-            logger.info(f"✓ OCR complete: extracted {len(result)} chars")
+            logger.info(f"[OCR] Complete: extracted {len(result)} chars")
             return result
         except Exception as e:
             raise ValueError(f"Error extracting text from PDF: {str(e)}")
@@ -167,7 +167,7 @@ class DocumentParser:
             sender, recipient, body = self.llm_parser.parse_document_with_llm(text)
             if sender or recipient:  # If LLM found something, use it
                 return sender, recipient, body
-            logger.info("⚠️ LLM didn't find sender/recipient, falling back to heuristics")
+            logger.info("[FALLBACK] LLM didn't find sender/recipient, using heuristics")
         
         # Fall back to heuristic parsing
         lines = text.strip().split('\n')
@@ -346,6 +346,10 @@ class DocumentParser:
         
         # Rest is body text
         body_text = '\n'.join(lines[body_start:]).strip()
+        
+        # Log heuristic method used
+        if sender_text or recipient_text:
+            logger.info(f"[HEURISTIC] Block detection completed")
         
         return sender_text, recipient_text, body_text
     
